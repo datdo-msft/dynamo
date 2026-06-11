@@ -3,8 +3,10 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
@@ -89,24 +91,20 @@ impl LoadThresholdConfig {
     }
 }
 
+/// Hysteresis window for the decode-overload latch. After a tripping event,
+/// the latch stays set for at least this long even if subsequent events report
+/// values below threshold. Configurable via `DYN_DECODE_OVERLOAD_HYSTERESIS_MS`
+/// (default 5000 ms). Read once at static init — the latch is per-rank state
+/// and doesn't need per-call env lookups.
+static DECODE_OVERLOAD_HYSTERESIS: LazyLock<Duration> = LazyLock::new(|| {
+    let millis = std::env::var("DYN_DECODE_OVERLOAD_HYSTERESIS_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(5_000);
+    Duration::from_millis(millis)
+});
+
 /// Worker load monitoring state per dp_rank
-#[derive(Clone, Debug)]
-struct DecodeOverloadLatchState {
-    latched_overloaded: bool,
-    kv_used_blocks_cleared: bool,
-    active_decode_blocks_cleared: bool,
-}
-
-impl Default for DecodeOverloadLatchState {
-    fn default() -> Self {
-        Self {
-            latched_overloaded: false,
-            kv_used_blocks_cleared: true,
-            active_decode_blocks_cleared: true,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct WorkerLoadState {
     pub active_decode_blocks: HashMap<u32, u64>,
@@ -115,7 +113,11 @@ pub struct WorkerLoadState {
     pub active_prefill_tokens: HashMap<u32, u64>,
     /// max_num_batched_tokens from runtime config (same for all dp_ranks)
     pub max_num_batched_tokens: HashMap<u32, u64>,
-    decode_overload_latches: HashMap<u32, DecodeOverloadLatchState>,
+    /// Per-dp_rank latch deadline. While `now < deadline`, the decode-overload
+    /// latch is held set even if current event signals are under threshold.
+    /// Entries with deadlines in the past are inactive but left in place
+    /// (cleared lazily on the next tripping event).
+    decode_overload_until: HashMap<u32, Instant>,
 }
 
 impl WorkerLoadState {
@@ -154,12 +156,14 @@ impl WorkerLoadState {
                 })
     }
 
-    fn update_decode_overload_latch(
+    fn update_decode_overload_latch_at(
         &mut self,
         dp_rank: u32,
         active_decode_blocks: Option<u64>,
         kv_used_blocks: Option<u64>,
         active_decode_blocks_threshold: f64,
+        now: Instant,
+        hysteresis: Duration,
     ) {
         let Some(&total_blocks) = self.kv_total_blocks.get(&dp_rank) else {
             return;
@@ -168,43 +172,27 @@ impl WorkerLoadState {
             return;
         }
 
-        let active_decode_overloaded = active_decode_blocks.is_some_and(|value| {
-            Self::is_decode_signal_overloaded(value, total_blocks, active_decode_blocks_threshold)
+        let active_decode_over = active_decode_blocks.is_some_and(|v| {
+            Self::is_decode_signal_overloaded(v, total_blocks, active_decode_blocks_threshold)
         });
-        let kv_used_overloaded = kv_used_blocks.is_some_and(|value| {
-            Self::is_decode_signal_overloaded(value, total_blocks, active_decode_blocks_threshold)
+        let kv_used_over = kv_used_blocks.is_some_and(|v| {
+            Self::is_decode_signal_overloaded(v, total_blocks, active_decode_blocks_threshold)
         });
 
-        let latch = self.decode_overload_latches.entry(dp_rank).or_default();
-        if active_decode_overloaded || kv_used_overloaded {
-            latch.latched_overloaded = true;
-        }
-        if let Some(value) = active_decode_blocks {
-            latch.active_decode_blocks_cleared = !Self::is_decode_signal_overloaded(
-                value,
-                total_blocks,
-                active_decode_blocks_threshold,
-            );
-        }
-        if let Some(value) = kv_used_blocks {
-            latch.kv_used_blocks_cleared = !Self::is_decode_signal_overloaded(
-                value,
-                total_blocks,
-                active_decode_blocks_threshold,
-            );
-        }
-        if latch.latched_overloaded
-            && latch.kv_used_blocks_cleared
-            && latch.active_decode_blocks_cleared
-        {
-            latch.latched_overloaded = false;
+        // Either signal over threshold (re)arms the latch for one hysteresis
+        // window. Under-threshold events don't actively clear — the deadline
+        // expires on its own, which is what makes the latch non-sticky.
+        if active_decode_over || kv_used_over {
+            self.decode_overload_until.insert(dp_rank, now + hysteresis);
         }
     }
 
-    fn update_from_active_load(
+    fn update_from_active_load_at(
         &mut self,
         active_load: &ActiveLoad,
         active_decode_blocks_threshold: Option<f64>,
+        now: Instant,
+        hysteresis: Duration,
     ) {
         let dp_rank = active_load.dp_rank;
         if let Some(active_blocks) = active_load.active_decode_blocks {
@@ -217,13 +205,28 @@ impl WorkerLoadState {
             self.active_prefill_tokens.insert(dp_rank, active_tokens);
         }
         if let Some(threshold) = active_decode_blocks_threshold {
-            self.update_decode_overload_latch(
+            self.update_decode_overload_latch_at(
                 dp_rank,
                 active_load.active_decode_blocks,
                 active_load.kv_used_blocks,
                 threshold,
+                now,
+                hysteresis,
             );
         }
+    }
+
+    fn update_from_active_load(
+        &mut self,
+        active_load: &ActiveLoad,
+        active_decode_blocks_threshold: Option<f64>,
+    ) {
+        self.update_from_active_load_at(
+            active_load,
+            active_decode_blocks_threshold,
+            Instant::now(),
+            *DECODE_OVERLOAD_HYSTERESIS,
+        );
     }
 
     /// Returns true if ALL dp_ranks are overloaded based on the threshold logic.
@@ -235,7 +238,7 @@ impl WorkerLoadState {
     /// For each dp_rank, a dp_rank is overloaded if ANY of these conditions is met (OR logic):
     /// 1. `active_prefill_tokens > active_prefill_tokens_threshold` (absolute, if set)
     /// 2. `active_prefill_tokens > frac * max_num_batched_tokens` (fractional, if set)
-    /// 3. decode overload latch set by either `kv_used_blocks` or `active_decode_blocks` (if set)
+    /// 3. decode latch deadline still in the future OR current signals over threshold (if set)
     ///
     /// The worker is overloaded only if ALL dp_ranks are overloaded.
     pub fn is_overloaded(
@@ -243,6 +246,23 @@ impl WorkerLoadState {
         active_decode_blocks_threshold: Option<f64>,
         active_prefill_tokens_threshold: Option<u64>,
         active_prefill_tokens_threshold_frac: Option<f64>,
+    ) -> bool {
+        self.is_overloaded_at(
+            active_decode_blocks_threshold,
+            active_prefill_tokens_threshold,
+            active_prefill_tokens_threshold_frac,
+            Instant::now(),
+        )
+    }
+
+    /// Variant of [`is_overloaded`](Self::is_overloaded) that accepts an
+    /// explicit `now` for testability of the hysteresis window.
+    pub fn is_overloaded_at(
+        &self,
+        active_decode_blocks_threshold: Option<f64>,
+        active_prefill_tokens_threshold: Option<u64>,
+        active_prefill_tokens_threshold_frac: Option<f64>,
+        now: Instant,
     ) -> bool {
         // Short-circuit if all thresholds are unset (i.e. no overload check can fire)
         if active_decode_blocks_threshold.is_none()
@@ -257,7 +277,7 @@ impl WorkerLoadState {
             .active_decode_blocks
             .keys()
             .chain(self.kv_used_blocks.keys())
-            .chain(self.decode_overload_latches.keys())
+            .chain(self.decode_overload_until.keys())
             .chain(self.active_prefill_tokens.keys())
             .copied()
             .collect();
@@ -291,14 +311,13 @@ impl WorkerLoadState {
                 }
             }
 
-            // Check 3: decode overload latch (OR-ed from kv_used_blocks and active_decode_blocks)
+            // Check 3: decode latch (deadline-based hysteresis OR current signals)
             if let Some(decode_threshold) = active_decode_blocks_threshold {
-                let is_overloaded = self
-                    .decode_overload_latches
+                let still_latched = self
+                    .decode_overload_until
                     .get(&dp_rank)
-                    .map(|latch| latch.latched_overloaded)
-                    .unwrap_or_else(|| self.current_decode_overloaded(dp_rank, decode_threshold));
-                if is_overloaded {
+                    .is_some_and(|deadline| now < *deadline);
+                if still_latched || self.current_decode_overloaded(dp_rank, decode_threshold) {
                     return true;
                 }
             }
@@ -441,8 +460,8 @@ impl KvWorkerMonitor {
     }
 
     /// Update thresholds from a `LoadThresholdConfig`. Only fields that are
-    /// `Some` in the input overwrite their counterparts; `None` fields leave
-    /// the existing value untouched.
+    /// `Some(v)` overwrite their counterparts with `Some(v)`; `None` input
+    /// fields are ignored entirely (they do NOT clear an existing setting).
     pub fn set_load_threshold_config(&self, config: &LoadThresholdConfig) {
         let mut guard = self.thresholds.write().unwrap();
         if let Some(v) = config.active_decode_blocks_threshold {
@@ -797,6 +816,8 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::{LoadThresholdConfig, WorkerLoadState};
     use dynamo_kv_router::protocols::ActiveLoad;
 
@@ -889,11 +910,109 @@ mod tests {
     }
 
     #[test]
-    fn decode_overload_latch_only_clears_after_both_signals_report_not_overloaded() {
+    fn decode_overload_latch_stays_set_within_hysteresis_window() {
+        // With time-based hysteresis the latch can't be force-cleared by an
+        // under-threshold event arriving inside the window — that's the
+        // property that prevents a single brief dip from masking an overload.
         let mut state = WorkerLoadState::default();
         state.kv_total_blocks.insert(0, 100);
+        let t0 = Instant::now();
+        let hysteresis = Duration::from_secs(5);
 
-        state.update_from_active_load(
+        state.update_from_active_load_at(
+            &ActiveLoad {
+                worker_id: 1,
+                dp_rank: 0,
+                active_decode_blocks: Some(90),
+                active_prefill_tokens: None,
+                kv_used_blocks: Some(90),
+            },
+            Some(0.6),
+            t0,
+            hysteresis,
+        );
+        // Both signals drop well under threshold 1s later — well inside the window.
+        state.update_from_active_load_at(
+            &ActiveLoad {
+                worker_id: 1,
+                dp_rank: 0,
+                active_decode_blocks: Some(10),
+                active_prefill_tokens: None,
+                kv_used_blocks: Some(10),
+            },
+            Some(0.6),
+            t0 + Duration::from_secs(1),
+            hysteresis,
+        );
+
+        assert!(state.is_overloaded_at(
+            Some(0.6),
+            Some(u64::MAX),
+            Some(2.0),
+            t0 + Duration::from_secs(2),
+        ));
+    }
+
+    #[test]
+    fn decode_overload_latch_clears_after_hysteresis_window_expires() {
+        // The motivating bug: the latch must not stay stuck forever just
+        // because the legacy AND-of-two-cleared-flags policy never finished
+        // clearing. Once the window has expired AND the latest known signals
+        // are under threshold, overload clears.
+        let mut state = WorkerLoadState::default();
+        state.kv_total_blocks.insert(0, 100);
+        let t0 = Instant::now();
+        let hysteresis = Duration::from_secs(5);
+
+        state.update_from_active_load_at(
+            &ActiveLoad {
+                worker_id: 1,
+                dp_rank: 0,
+                active_decode_blocks: Some(90),
+                active_prefill_tokens: None,
+                kv_used_blocks: Some(90),
+            },
+            Some(0.6),
+            t0,
+            hysteresis,
+        );
+        // After the window, BOTH fields re-publish below threshold (matches
+        // what real SGLang workers do — they re-emit the full ActiveLoad
+        // payload each tick, not partial deltas).
+        state.update_from_active_load_at(
+            &ActiveLoad {
+                worker_id: 1,
+                dp_rank: 0,
+                active_decode_blocks: Some(10),
+                active_prefill_tokens: None,
+                kv_used_blocks: Some(10),
+            },
+            Some(0.6),
+            t0 + Duration::from_secs(6),
+            hysteresis,
+        );
+
+        assert!(!state.is_overloaded_at(
+            Some(0.6),
+            Some(u64::MAX),
+            Some(2.0),
+            t0 + Duration::from_secs(7),
+        ));
+    }
+
+    #[test]
+    fn decode_overload_latch_clears_purely_from_window_expiry_without_updates() {
+        // The previous policy could not clear at all if a worker stopped
+        // emitting one of the two fields after a trip. Now: the deadline
+        // expires on its own and `is_overloaded` reports false once both
+        // (a) the deadline is in the past and (b) the latest known signals
+        // are under threshold.
+        let mut state = WorkerLoadState::default();
+        state.kv_total_blocks.insert(0, 100);
+        let t0 = Instant::now();
+        let hysteresis = Duration::from_secs(5);
+
+        state.update_from_active_load_at(
             &ActiveLoad {
                 worker_id: 1,
                 dp_rank: 0,
@@ -902,52 +1021,22 @@ mod tests {
                 kv_used_blocks: Some(90),
             },
             Some(0.6),
+            t0,
+            hysteresis,
         );
-        assert!(state.is_overloaded(Some(0.6), Some(u64::MAX), Some(2.0)));
-
-        state.update_from_active_load(
-            &ActiveLoad {
-                worker_id: 1,
-                dp_rank: 0,
-                active_decode_blocks: Some(10),
-                active_prefill_tokens: None,
-                kv_used_blocks: None,
-            },
+        // No clearing event whatsoever; only time passes. Latest known
+        // kv_used_blocks (90) is still over threshold, so the current-signal
+        // branch keeps it overloaded.
+        assert!(state.is_overloaded_at(
             Some(0.6),
-        );
-        assert!(state.is_overloaded(Some(0.6), Some(u64::MAX), Some(2.0)));
+            Some(u64::MAX),
+            Some(2.0),
+            t0 + Duration::from_secs(10),
+        ));
 
-        state.update_from_active_load(
-            &ActiveLoad {
-                worker_id: 1,
-                dp_rank: 0,
-                active_decode_blocks: None,
-                active_prefill_tokens: None,
-                kv_used_blocks: Some(10),
-            },
-            Some(0.6),
-        );
-        assert!(!state.is_overloaded(Some(0.6), Some(u64::MAX), Some(2.0)));
-    }
-
-    #[test]
-    fn decode_overload_latch_clears_with_only_kv_used_blocks_signal() {
-        let mut state = WorkerLoadState::default();
-        state.kv_total_blocks.insert(0, 100);
-
-        state.update_from_active_load(
-            &ActiveLoad {
-                worker_id: 1,
-                dp_rank: 0,
-                active_decode_blocks: None,
-                active_prefill_tokens: None,
-                kv_used_blocks: Some(90),
-            },
-            Some(0.6),
-        );
-        assert!(state.is_overloaded(Some(0.6), Some(u64::MAX), Some(2.0)));
-
-        state.update_from_active_load(
+        // A single under-threshold event after the window — replaces the
+        // last known signal and the deadline is already past.
+        state.update_from_active_load_at(
             &ActiveLoad {
                 worker_id: 1,
                 dp_rank: 0,
@@ -956,16 +1045,28 @@ mod tests {
                 kv_used_blocks: Some(10),
             },
             Some(0.6),
+            t0 + Duration::from_secs(11),
+            hysteresis,
         );
-        assert!(!state.is_overloaded(Some(0.6), Some(u64::MAX), Some(2.0)));
+        assert!(!state.is_overloaded_at(
+            Some(0.6),
+            Some(u64::MAX),
+            Some(2.0),
+            t0 + Duration::from_secs(12),
+        ));
     }
 
     #[test]
-    fn decode_overload_latch_clears_with_only_active_decode_blocks_signal() {
+    fn decode_overload_latch_is_refreshed_by_repeated_tripping_events() {
+        // A second tripping event extends the deadline relative to its own
+        // arrival time, so a sustained-overload worker stays latched as long
+        // as it keeps reporting over-threshold values.
         let mut state = WorkerLoadState::default();
         state.kv_total_blocks.insert(0, 100);
+        let t0 = Instant::now();
+        let hysteresis = Duration::from_secs(5);
 
-        state.update_from_active_load(
+        state.update_from_active_load_at(
             &ActiveLoad {
                 worker_id: 1,
                 dp_rank: 0,
@@ -974,50 +1075,31 @@ mod tests {
                 kv_used_blocks: None,
             },
             Some(0.6),
+            t0,
+            hysteresis,
         );
-        assert!(state.is_overloaded(Some(0.6), Some(u64::MAX), Some(2.0)));
-
-        state.update_from_active_load(
+        // Second trip 4s later — deadline pushed to t0+9.
+        state.update_from_active_load_at(
             &ActiveLoad {
                 worker_id: 1,
                 dp_rank: 0,
-                active_decode_blocks: Some(10),
+                active_decode_blocks: Some(95),
                 active_prefill_tokens: None,
                 kv_used_blocks: None,
             },
             Some(0.6),
+            t0 + Duration::from_secs(4),
+            hysteresis,
         );
-        assert!(!state.is_overloaded(Some(0.6), Some(u64::MAX), Some(2.0)));
-    }
 
-    #[test]
-    fn decode_overload_latch_clears_when_both_signals_are_not_overloaded_in_same_event() {
-        let mut state = WorkerLoadState::default();
-        state.kv_total_blocks.insert(0, 100);
-
-        state.update_from_active_load(
-            &ActiveLoad {
-                worker_id: 1,
-                dp_rank: 0,
-                active_decode_blocks: Some(90),
-                active_prefill_tokens: None,
-                kv_used_blocks: None,
-            },
+        // t0+6 would be past the original deadline but only 2s past the
+        // refresh — still latched.
+        assert!(state.is_overloaded_at(
             Some(0.6),
-        );
-        assert!(state.is_overloaded(Some(0.6), Some(u64::MAX), Some(2.0)));
-
-        state.update_from_active_load(
-            &ActiveLoad {
-                worker_id: 1,
-                dp_rank: 0,
-                active_decode_blocks: Some(10),
-                active_prefill_tokens: None,
-                kv_used_blocks: Some(10),
-            },
-            Some(0.6),
-        );
-        assert!(!state.is_overloaded(Some(0.6), Some(u64::MAX), Some(2.0)));
+            Some(u64::MAX),
+            Some(2.0),
+            t0 + Duration::from_secs(6),
+        ));
     }
 
     #[test]
@@ -1092,5 +1174,215 @@ mod tests {
         state.active_prefill_tokens.insert(0, 2_500);
 
         assert!(state.is_overloaded(None, None, Some(2.0)));
+    }
+
+    // -- gap-coverage tests for the time-deadline hysteresis design --
+
+    #[test]
+    fn decode_overload_latch_uses_strict_greater_than_threshold() {
+        // `is_decode_signal_overloaded` uses strict `>`: exactly hitting the
+        // threshold must NOT trip the latch. With threshold 0.6 * 100 = 60,
+        // a kv_used_blocks reading of exactly 60 should leave the worker free.
+        let mut state = WorkerLoadState::default();
+        state.kv_total_blocks.insert(0, 100);
+        let t0 = Instant::now();
+        let hysteresis = Duration::from_secs(5);
+
+        state.update_from_active_load_at(
+            &ActiveLoad {
+                worker_id: 1,
+                dp_rank: 0,
+                active_decode_blocks: Some(60),
+                active_prefill_tokens: None,
+                kv_used_blocks: Some(60),
+            },
+            Some(0.6),
+            t0,
+            hysteresis,
+        );
+        assert!(!state.is_overloaded_at(Some(0.6), Some(u64::MAX), Some(2.0), t0));
+    }
+
+    #[test]
+    fn decode_overload_latch_short_circuits_on_zero_total_blocks() {
+        // total_blocks=0 means the worker hasn't reported a KV-cache size yet;
+        // we cannot evaluate a ratio so the gate must stay off (no panic, no trip).
+        let mut state = WorkerLoadState::default();
+        state.kv_total_blocks.insert(0, 0);
+        let t0 = Instant::now();
+        let hysteresis = Duration::from_secs(5);
+
+        state.update_from_active_load_at(
+            &ActiveLoad {
+                worker_id: 1,
+                dp_rank: 0,
+                active_decode_blocks: Some(u64::MAX),
+                active_prefill_tokens: None,
+                kv_used_blocks: Some(u64::MAX),
+            },
+            Some(0.6),
+            t0,
+            hysteresis,
+        );
+        assert!(state.decode_overload_until.is_empty());
+        assert!(!state.is_overloaded_at(Some(0.6), Some(u64::MAX), Some(2.0), t0));
+    }
+
+    #[test]
+    fn decode_overload_latch_not_armed_when_decode_threshold_is_none() {
+        // With the decode threshold disabled (None), update_from_active_load
+        // must skip the latch path entirely so no deadline is ever recorded.
+        let mut state = WorkerLoadState::default();
+        state.kv_total_blocks.insert(0, 100);
+        let t0 = Instant::now();
+        let hysteresis = Duration::from_secs(5);
+
+        state.update_from_active_load_at(
+            &ActiveLoad {
+                worker_id: 1,
+                dp_rank: 0,
+                active_decode_blocks: Some(99),
+                active_prefill_tokens: None,
+                kv_used_blocks: Some(99),
+            },
+            None,
+            t0,
+            hysteresis,
+        );
+        assert!(state.decode_overload_until.is_empty());
+    }
+
+    #[test]
+    fn multi_dp_rank_worker_not_overloaded_when_only_one_rank_is_latched() {
+        // The AND-across-dp_ranks invariant must survive the per-rank-deadline
+        // refactor: latch rank 0 inside its window, leave rank 1 free →
+        // worker as a whole is NOT overloaded.
+        let mut state = WorkerLoadState::default();
+        state.kv_total_blocks.insert(0, 100);
+        state.kv_total_blocks.insert(1, 100);
+        let t0 = Instant::now();
+        let hysteresis = Duration::from_secs(5);
+
+        state.update_from_active_load_at(
+            &ActiveLoad {
+                worker_id: 1,
+                dp_rank: 0,
+                active_decode_blocks: Some(90),
+                active_prefill_tokens: None,
+                kv_used_blocks: Some(90),
+            },
+            Some(0.6),
+            t0,
+            hysteresis,
+        );
+        state.update_from_active_load_at(
+            &ActiveLoad {
+                worker_id: 1,
+                dp_rank: 1,
+                active_decode_blocks: Some(10),
+                active_prefill_tokens: None,
+                kv_used_blocks: Some(10),
+            },
+            Some(0.6),
+            t0,
+            hysteresis,
+        );
+        assert!(!state.is_overloaded_at(Some(0.6), Some(u64::MAX), Some(2.0), t0));
+    }
+
+    #[test]
+    fn multi_dp_rank_worker_overloaded_when_all_ranks_latched() {
+        // Counterpart: both ranks tripped → worker overloaded.
+        let mut state = WorkerLoadState::default();
+        state.kv_total_blocks.insert(0, 100);
+        state.kv_total_blocks.insert(1, 100);
+        let t0 = Instant::now();
+        let hysteresis = Duration::from_secs(5);
+
+        for dp_rank in [0u32, 1] {
+            state.update_from_active_load_at(
+                &ActiveLoad {
+                    worker_id: 1,
+                    dp_rank,
+                    active_decode_blocks: Some(90),
+                    active_prefill_tokens: None,
+                    kv_used_blocks: Some(90),
+                },
+                Some(0.6),
+                t0,
+                hysteresis,
+            );
+        }
+        assert!(state.is_overloaded_at(Some(0.6), Some(u64::MAX), Some(2.0), t0));
+    }
+
+    #[test]
+    fn stale_deadline_does_not_force_overload_when_current_signals_are_under_threshold() {
+        // Doc says expired entries are "left in place (cleared lazily on the
+        // next tripping event)". Verify they're inert: a worker that tripped
+        // long ago and is currently reporting low values is NOT overloaded
+        // just because the stale entry still exists in `decode_overload_until`.
+        let mut state = WorkerLoadState::default();
+        state.kv_total_blocks.insert(0, 100);
+        let t0 = Instant::now();
+        let hysteresis = Duration::from_secs(5);
+
+        state.update_from_active_load_at(
+            &ActiveLoad {
+                worker_id: 1,
+                dp_rank: 0,
+                active_decode_blocks: Some(90),
+                active_prefill_tokens: None,
+                kv_used_blocks: Some(90),
+            },
+            Some(0.6),
+            t0,
+            hysteresis,
+        );
+        // After the window expires, report well-under-threshold signals.
+        state.update_from_active_load_at(
+            &ActiveLoad {
+                worker_id: 1,
+                dp_rank: 0,
+                active_decode_blocks: Some(5),
+                active_prefill_tokens: None,
+                kv_used_blocks: Some(5),
+            },
+            Some(0.6),
+            t0 + Duration::from_secs(10),
+            hysteresis,
+        );
+        // The deadline entry is intentionally left in place — but it's in the past.
+        assert!(state.decode_overload_until.contains_key(&0));
+        assert!(!state.is_overloaded_at(
+            Some(0.6),
+            Some(u64::MAX),
+            Some(2.0),
+            t0 + Duration::from_secs(11),
+        ));
+    }
+
+    #[test]
+    fn production_path_is_overloaded_uses_real_clock_after_real_trip() {
+        // Smoke test the no-`_at` production entry points actually feed
+        // `Instant::now()` through correctly. Tripping the latch via the
+        // real `update_from_active_load` and then calling the real
+        // `is_overloaded` immediately afterward must report overloaded
+        // (the static-init hysteresis default is 5 s, comfortably larger
+        // than any reasonable test-machine schedule jitter).
+        let mut state = WorkerLoadState::default();
+        state.kv_total_blocks.insert(0, 100);
+
+        state.update_from_active_load(
+            &ActiveLoad {
+                worker_id: 1,
+                dp_rank: 0,
+                active_decode_blocks: Some(90),
+                active_prefill_tokens: None,
+                kv_used_blocks: Some(90),
+            },
+            Some(0.6),
+        );
+        assert!(state.is_overloaded(Some(0.6), Some(u64::MAX), Some(2.0)));
     }
 }
